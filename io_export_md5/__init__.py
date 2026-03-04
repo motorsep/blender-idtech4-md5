@@ -155,6 +155,10 @@ class Vertex:
 
     def generateweights(self):
         self.firstweightindx = self.submesh.next_weight_id
+        # MD5 format: max 4 bone influences per vertex
+        if len(self.influences) > 4:
+            self.influences.sort(key=lambda inf: inf.weight, reverse=True)
+            self.influences = self.influences[:4]
         total = sum(inf.weight for inf in self.influences)
         if total != 0:
             for inf in self.influences:
