@@ -744,12 +744,13 @@ def save_md5(settings):
 
         objects = []
         for submesh in meshes[0].submeshes:
-            if len(submesh.weights) > 0:
+            if len(submesh.vertices) > 0:
                 obj = None
                 for sob in bpy.context.selected_objects:
                     if sob and sob.type == 'MESH' and sob.name == submesh.name:
                         obj = sob
-                objects.append(obj)
+                if obj is not None:
+                    objects.append(obj)
 
         generateboundingbox(objects, animation, [rangestart, rangeend])
         f.write(animation.to_md5anim())
