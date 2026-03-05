@@ -475,6 +475,7 @@ def save_md5(settings):
     scale = settings.scale
     thearmature = None
     md5v12 = settings.md5v12
+    use_sharp_edges = settings.use_sharp_edges
     md5_version = 12 if md5v12 else 10
 
     skeleton = Skeleton(md5_version, "Exported from Blender by io_export_md5.py")
@@ -577,6 +578,21 @@ def save_md5(settings):
             # Free evaluated mesh — we're done with it
             eval_obj.to_mesh_clear()
 
+            # Build sharp edge set for vertex splitting
+            sharp_edge_verts = set()
+            if use_sharp_edges:
+                sharp_attr = me.attributes.get('sharp_edge')
+                if sharp_attr:
+                    for edge in me.edges:
+                        if sharp_attr.data[edge.index].value:
+                            sharp_edge_verts.add(frozenset((edge.vertices[0], edge.vertices[1])))
+                else:
+                    for edge in me.edges:
+                        if edge.use_sharp:
+                            sharp_edge_verts.add(frozenset((edge.vertices[0], edge.vertices[1])))
+                if sharp_edge_verts:
+                    print("  Sharp edges: %d (will split vertices)" % len(sharp_edge_verts))
+
             me.calc_loop_triangles()
             tri_faces = list(me.loop_triangles)
 
@@ -666,19 +682,33 @@ def save_md5(settings):
                                     continue
 
                         else:
-                            # Check if this loop's corner normal differs from the
-                            # existing vertex's corner normal (sharp edge detection).
-                            # We compare corner-to-corner from the SAME mesh (evaluated)
-                            # to avoid mismatches between different computation methods.
                             need_split = False
-                            if loop_idx in loop_normal_data and \
-                               hasattr(vertex, '_corner_normal'):
-                                ln = loop_normal_data[loop_idx]
-                                vn = vertex._corner_normal
-                                dot = ln[0]*vn[0] + ln[1]*vn[1] + ln[2]*vn[2]
-                                if dot < 0.995:  # ~5.7 degrees
-                                    # Check existing clones for matching corner normal
-                                    found_clone = False
+
+                            if use_sharp_edges:
+                                # Check 1: sharp edges (from "Mark Sharp")
+                                if sharp_edge_verts:
+                                    for other_i in range(3):
+                                        if other_i != i:
+                                            other_vi = tv[other_i]
+                                            if frozenset((vi, other_vi)) in sharp_edge_verts:
+                                                need_split = True
+                                                break
+
+                                # Check 2: evaluated corner normals differ
+                                # (from Smooth by Angle modifier, custom normals)
+                                if not need_split and loop_idx in loop_normal_data and \
+                                   hasattr(vertex, '_corner_normal'):
+                                    ln = loop_normal_data[loop_idx]
+                                    vn = vertex._corner_normal
+                                    dot = ln[0]*vn[0] + ln[1]*vn[1] + ln[2]*vn[2]
+                                    if dot < 0.995:  # ~5.7 degrees
+                                        need_split = True
+
+                            if need_split:
+                                # Check existing clones for matching corner normal
+                                found_clone = False
+                                if loop_idx in loop_normal_data:
+                                    ln = loop_normal_data[loop_idx]
                                     for clone in vertex.clones:
                                         if hasattr(clone, '_corner_normal'):
                                             cn = clone._corner_normal
@@ -687,27 +717,24 @@ def save_md5(settings):
                                                 vertex = clone
                                                 found_clone = True
                                                 break
-                                    if not found_clone:
-                                        need_split = True
-
-                            if need_split:
-                                old_vertex = vertex
-                                # v12: use corner normal for the split vertex
-                                # v10: use smooth normal (engine derives its own)
-                                split_normal = loop_normal_data[loop_idx] if md5v12 else normal
-                                vertex = Vertex(submesh, vertex.loc, split_normal)
-                                vertex._corner_normal = loop_normal_data[loop_idx]
-                                createB += 1
-                                vertex.cloned_from = old_vertex
-                                vertex.influences = old_vertex.influences
-                                old_vertex.clones.append(vertex)
-                                if md5v12 and loop_idx in tangent_data:
-                                    t_vec, b_sign = tangent_data[loop_idx]
-                                    t_world = (w_matrix.to_3x3() @ t_vec).normalized()
-                                    vertex.tangent = t_world
-                                    vertex.bitangent_sign = b_sign
-                                if md5v12 and color_layer:
-                                    vertex.color = old_vertex.color
+                                if not found_clone:
+                                    old_vertex = vertex
+                                    # v12: use corner normal for the split vertex
+                                    # v10: use smooth normal (engine derives its own)
+                                    split_normal = loop_normal_data[loop_idx]
+                                    vertex = Vertex(submesh, vertex.loc, split_normal)
+                                    vertex._corner_normal = loop_normal_data[loop_idx]
+                                    createB += 1
+                                    vertex.cloned_from = old_vertex
+                                    vertex.influences = old_vertex.influences
+                                    old_vertex.clones.append(vertex)
+                                    if md5v12 and loop_idx in tangent_data:
+                                        t_vec, b_sign = tangent_data[loop_idx]
+                                        t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                        vertex.tangent = t_world
+                                        vertex.bitangent_sign = b_sign
+                                    if md5v12 and color_layer:
+                                        vertex.color = old_vertex.color
 
                             elif not tri.use_smooth:
                                 # Flat-shading clone
@@ -890,7 +917,7 @@ def save_md5(settings):
 
 class md5Settings:
     def __init__(self, savepath, scale, actions, sel_only, prefix, name,
-                 md5v12=False):
+                 md5v12=False, use_sharp_edges=True):
         self.savepath = savepath
         self.scale = scale
         self.md5actions = actions
@@ -898,6 +925,7 @@ class md5Settings:
         self.name = name
         self.prefix = prefix
         self.md5v12 = md5v12
+        self.use_sharp_edges = use_sharp_edges
 
 # ---------------------------------------------------------------------------
 # UI Classes
@@ -1074,6 +1102,12 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
                     "MikkTSpace tangents, and vertex colors",
         default=False)
 
+    use_sharp_edges: BoolProperty(
+        name="Use sharp edges",
+        description="Split vertices at edges marked sharp in Blender. "
+                    "Works for both v10 and v12",
+        default=True)
+
     md5actions_idx: IntProperty()
 
     def draw(self, context):
@@ -1089,6 +1123,7 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
         # v12 checkbox
         layout.separator()
         layout.prop(self, "md5v12")
+        layout.prop(self, "use_sharp_edges")
 
         a_count = len(self.md5actions)
         if a_count == 0:
@@ -1126,7 +1161,8 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
             sel_only=self.use_sel_only,
             prefix=self.use_prefix,
             name=self.md5name,
-            md5v12=self.md5v12)
+            md5v12=self.md5v12,
+            use_sharp_edges=self.use_sharp_edges)
         save_md5(settings)
         return {'FINISHED'}
 
