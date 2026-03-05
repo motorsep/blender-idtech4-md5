@@ -22,24 +22,24 @@
 # v1.1.0 Gert De Roost: bone export filtering and reparenting
 # v1.0.6 CodeManX: fixes and UI
 # v2.0.0 Ported to Blender 4.2+:
-#   All hand-rolled matrix math replaced with Blender built-ins:
-#     matrix_invert()  -> .inverted()
-#     point_by_matrix()-> matrix @ Vector
-#     .col[3][0:3]     -> .translation
-#     matrix2quaternion-> .to_quaternion()
+#   All hand-rolled matrix math replaced with Blender built-ins
 #   * -> @ for matrix/vector multiplication
 #   tessfaces -> loop_triangles + uv_layers
 #   bone.Export -> bone collection membership (fallback: all bones)
 #   register_module -> register_class
 #   INFO_MT_file_export -> TOPBAR_MT_file_export
+# v2.1.0 MD5Version 12 support:
+#   Per-vertex normals (bone-local space)
+#   MikkTSpace tangent + bitangent sign (bone-local space)
+#   Vertex colors (optional)
 
 bl_info = {
-    "name": "Export idTech4 MD5 (.md5mesh/.md5anim)",
+    "name": "Export idTech4.x MD5 (.md5mesh/.md5anim)",
     "author": "Paul Zirkle, der_ton, Gert De Roost, CodeManX, motorsep",
-    "version": (2, 0, 0),
+    "version": (2, 1, 0),
     "blender": (4, 2, 0),
-    "location": "File > Export > idTech 4 MD5",
-    "description": "Export idTech4 MD5 mesh and animation",
+    "location": "File > Export > idTech 4.x MD5",
+    "description": "Export idTech4.x MD5 mesh and animation (v10 and v12)",
     "warning": "",
     "wiki_url": "",
     "tracker_url": "",
@@ -87,10 +87,10 @@ class Mesh:
         self.name = name
         self.submeshes = []
         self.next_submesh_id = 0
-    def to_md5mesh(self):
+    def to_md5mesh(self, md5v12=False):
         buf = ""
         for sm in self.submeshes:
-            buf += "mesh {\n" + sm.to_md5mesh() + "}\n\n"
+            buf += "mesh {\n" + sm.to_md5mesh(md5v12) + "}\n\n"
         return buf
 
 
@@ -121,20 +121,31 @@ class SubMesh:
         for vert in self.vertices:
             vert.generateweights()
 
-    def to_md5mesh(self):
+    def to_md5mesh(self, md5v12=False):
         self.generateweights()
         buf = "\tshader \"%s\"\n\n" % self.material.to_md5mesh()
         if not self.weights:
             return buf + "\tnumverts 0\n\n\tnumtris 0\n\n\tnumweights 0\n"
         buf += "\tnumverts %i\n" % len(self.vertices)
         for i, v in enumerate(self.vertices):
-            buf += "\tvert %i %s\n" % (i, v.to_md5mesh())
+            buf += "\tvert %i %s\n" % (i, v.to_md5mesh(md5v12))
         buf += "\n\tnumtris %i\n" % len(self.faces)
         for i, f in enumerate(self.faces):
             buf += "\ttri %i %s\n" % (i, f.to_md5mesh())
         buf += "\n\tnumweights %i\n" % len(self.weights)
         for i, w in enumerate(self.weights):
             buf += "\tweight %i %s\n" % (i, w.to_md5mesh())
+
+        # v12: vertex colors block
+        if md5v12:
+            has_colors = any(v.color is not None for v in self.vertices)
+            if has_colors:
+                buf += "\n\tnumvertexcolors %i\n" % len(self.vertices)
+                for i, v in enumerate(self.vertices):
+                    c = v.color if v.color else (1.0, 1.0, 1.0, 1.0)
+                    buf += "\tvertexcolor %i ( %f %f %f %f )\n" % (
+                        i, c[0], c[1], c[2], c[3])
+
         return buf
 
 
@@ -142,6 +153,9 @@ class Vertex:
     def __init__(self, submesh, loc, normal):
         self.loc = loc
         self.normal = normal
+        self.tangent = None       # v12: (tx, ty, tz)
+        self.bitangent_sign = 1.0 # v12: +1 or -1
+        self.color = None         # v12: (r, g, b, a) or None
         self.maps = []
         self.influences = []
         self.weights = []
@@ -171,12 +185,45 @@ class Vertex:
             self.submesh.weights.append(w)
             self.weights.append(w)
 
-    def to_md5mesh(self):
+    def _get_bone_local_normal_tangent(self):
+        """Transform normal and tangent from world space to bone-local space.
+        Uses the dominant (highest weight) bone for the transform, matching
+        how the engine will reconstruct them."""
+        if not self.influences:
+            n = self.normal
+            t = self.tangent if self.tangent else mathutils.Vector((1, 0, 0))
+            return (n[0], n[1], n[2]), (t[0], t[1], t[2])
+
+        # Find dominant bone (highest weight)
+        best = max(self.influences, key=lambda inf: inf.weight)
+        inv_bone = best.bone.matrix.inverted().to_3x3()
+
+        n_world = mathutils.Vector(self.normal).normalized()
+        n_local = (inv_bone @ n_world).normalized()
+
+        if self.tangent:
+            t_world = mathutils.Vector(self.tangent).normalized()
+            t_local = (inv_bone @ t_world).normalized()
+        else:
+            t_local = mathutils.Vector((1, 0, 0))
+
+        return (n_local[0], n_local[1], n_local[2]), \
+               (t_local[0], t_local[1], t_local[2])
+
+    def to_md5mesh(self, md5v12=False):
         if self.maps:
             buf = self.maps[0].to_md5mesh()
         else:
             buf = "( %f %f )" % (self.loc[0], self.loc[1])
-        return buf + " %i %i" % (self.firstweightindx, len(self.influences))
+        buf += " %i %i" % (self.firstweightindx, len(self.influences))
+
+        if md5v12:
+            nl, tl = self._get_bone_local_normal_tangent()
+            buf += " ( %f %f %f )" % (nl[0], nl[1], nl[2])
+            buf += " ( %f %f %f %f )" % (tl[0], tl[1], tl[2],
+                                          self.bitangent_sign)
+
+        return buf
 
 
 class Map:
@@ -193,8 +240,6 @@ class Weight:
         self.weight = weight
         self.vertex = vertex
         self.indx = weightindx
-        # Blender 4.x: use built-in .inverted() and @ operator
-        # Replaces hand-rolled matrix_invert() + point_by_matrix()
         invbonematrix = bone.matrix.inverted()
         result = invbonematrix @ mathutils.Vector((x, y, z, 1.0))
         self.x, self.y, self.z = result[0], result[1], result[2]
@@ -263,10 +308,8 @@ class Bone:
         buf = "\t\"%s\"\t" % self.name
         parentindex = self.parent.id if self.parent else -1
         buf += "%i " % parentindex
-        # Blender 4.x: .translation replaces .col[3][0:3]
         pos = self.matrix.translation
         buf += "( %f %f %f ) " % (pos[0] * scale, pos[1] * scale, pos[2] * scale)
-        # Blender 4.x: .to_quaternion() replaces hand-rolled matrix2quaternion
         bquat = self.matrix.to_quaternion()
         bquat.normalize()
         qx, qy, qz = bquat.x, bquat.y, bquat.z
@@ -277,6 +320,7 @@ class Bone:
             buf += self.parent.name
         buf += "\n"
         return buf
+
 
 class MD5Animation:
     def __init__(self, md5skel, MD5Version=10, commandline=""):
@@ -314,7 +358,6 @@ class MD5Animation:
             else:
                 rot = bone.matrix.to_quaternion()
                 rot.normalize()
-                # Blender 4.x: .translation replaces .col[3][0:3]
                 tx, ty, tz = bone.matrix.translation
                 self.baseframe[bone.id] = (
                     tx * scale, ty * scale, tz * scale,
@@ -389,7 +432,6 @@ def generateboundingbox(objects, md5animation, framerange):
         for obj in objects:
             if obj and obj.type == 'MESH' and len(obj.data.polygons) > 0:
                 for v in obj.bound_box:
-                    # Blender 4.x: @ replaces *
                     corners.append(obj.matrix_world @ mathutils.Vector(v))
         mn, mx = getminmax(corners)
         md5animation.bounds.append((
@@ -432,8 +474,11 @@ def save_md5(settings):
     global BONES, scale
     scale = settings.scale
     thearmature = None
+    md5v12 = settings.md5v12
+    use_sharp_edges = settings.use_sharp_edges
+    md5_version = 12 if md5v12 else 10
 
-    skeleton = Skeleton(10, "Exported from Blender by io_export_md5.py")
+    skeleton = Skeleton(md5_version, "Exported from Blender by io_export_md5.py")
     bpy.context.scene.frame_set(bpy.context.scene.frame_start)
     BONES = {}
 
@@ -447,7 +492,6 @@ def save_md5(settings):
             def treat_bone(b, parent=None):
                 if parent and b.parent and b.parent.name != parent.name:
                     return
-                # Blender 4.x: @ replaces *
                 mat = w_matrix @ b.matrix_local
                 bone = Bone(skeleton, parent, b.name, mat, b)
                 if b.children:
@@ -466,21 +510,99 @@ def save_md5(settings):
 
     # --- Second pass: meshes ---
     meshes = []
+    depsgraph = bpy.context.evaluated_depsgraph_get()
     for obj in bpy.context.selected_objects:
         if obj.type == 'MESH' and len(obj.data.vertices) > 0:
-            me = obj.data
+            me = obj.data  # raw mesh for geometry, UVs, weights
             mesh = Mesh(obj.name)
             print("Processing mesh: " + obj.name)
             meshes.append(mesh)
 
+            # Get evaluated mesh for normals/tangents only
+            # (reflects modifiers like Smooth by Angle without altering geometry)
+            eval_obj = obj.evaluated_get(depsgraph)
+            eval_me = eval_obj.to_mesh()
+
             w_matrix = obj.matrix_world
             verts = me.vertices
 
-            # Blender 4.x: loop_triangles replaces tessfaces
-            me.calc_loop_triangles()
             uv_layer = me.uv_layers.active
+
+            # Gather per-loop split normals from EVALUATED mesh.
+            # corner_normals reflect sharp edges, auto-smooth, custom normals,
+            # and any normal-affecting modifiers.
+            # We use these to DETECT where splits are needed, but for the actual
+            # stored normal value on smooth vertices, we use the raw vertex normal
+            # to preserve exact consistency with bone transforms.
+            w_mat3 = w_matrix.to_3x3()
+            loop_normal_data = {}  # loop_index -> normal_vec (world space)
+            # Only use evaluated normals if vertex count matches (modifiers
+            # didn't change topology). If topology changed, fall back to raw.
+            if len(eval_me.vertices) == len(me.vertices) and \
+               len(eval_me.loops) == len(me.loops):
+                for loop in eval_me.loops:
+                    cn = eval_me.corner_normals[loop.index].vector
+                    loop_normal_data[loop.index] = (w_mat3 @ cn).normalized()
+                print("  Split normals from evaluated mesh: %d loops" % len(loop_normal_data))
+            else:
+                print("  WARNING: Modifier changes topology (%d->%d verts), "
+                      "using raw normals" % (len(me.vertices), len(eval_me.vertices)))
+                for loop in me.loops:
+                    cn = me.corner_normals[loop.index].vector
+                    loop_normal_data[loop.index] = (w_mat3 @ cn).normalized()
+
+            # Per-vertex smooth normal from RAW mesh
+            vert_smooth_normal = {}
+            for vi_idx in range(len(verts)):
+                vert_smooth_normal[vi_idx] = (w_mat3 @ verts[vi_idx].normal).normalized()
+
+            print("  Split normals gathered for %d loops" % len(loop_normal_data))
+
+            # v12: compute MikkTSpace tangents from evaluated mesh
+            tangent_data = {}
+            if md5v12 and uv_layer:
+                eval_uv = eval_me.uv_layers.active
+                if eval_uv and len(eval_me.vertices) == len(me.vertices):
+                    try:
+                        eval_me.calc_tangents(uvmap=eval_uv.name)
+                        for loop in eval_me.loops:
+                            tangent_data[loop.index] = (
+                                loop.tangent.copy(),
+                                loop.bitangent_sign
+                            )
+                        print("  MikkTSpace tangents computed for %d loops" % len(tangent_data))
+                        eval_me.free_tangents()
+                    except Exception as e:
+                        print("  WARNING: calc_tangents failed: %s" % str(e))
+
+            # Free evaluated mesh — we're done with it
+            eval_obj.to_mesh_clear()
+
+            # Build sharp edge set for vertex splitting
+            sharp_edge_verts = set()
+            if use_sharp_edges:
+                sharp_attr = me.attributes.get('sharp_edge')
+                if sharp_attr:
+                    for edge in me.edges:
+                        if sharp_attr.data[edge.index].value:
+                            sharp_edge_verts.add(frozenset((edge.vertices[0], edge.vertices[1])))
+                else:
+                    for edge in me.edges:
+                        if edge.use_sharp:
+                            sharp_edge_verts.add(frozenset((edge.vertices[0], edge.vertices[1])))
+                if sharp_edge_verts:
+                    print("  Sharp edges: %d (will split vertices)" % len(sharp_edge_verts))
+
+            me.calc_loop_triangles()
             tri_faces = list(me.loop_triangles)
 
+            # v12: vertex colors
+            color_layer = None
+            if md5v12:
+                for attr in me.color_attributes:
+                    color_layer = attr
+                    print("  Using color attribute: %s" % attr.name)
+                    break
             createA = createB = createC = 0
 
             while tri_faces:
@@ -496,11 +618,9 @@ def save_md5(settings):
 
                 for tri in tri_faces[:]:
                     tv = tri.vertices
-                    # Remove degenerate
                     if len(tv) < 3 or tv[0] == tv[1] or tv[0] == tv[2] or tv[1] == tv[2]:
                         tri_faces.remove(tri)
                         continue
-                    # Skip different material
                     if tri.material_index != mat_idx:
                         continue
                     tri_faces.remove(tri)
@@ -510,21 +630,47 @@ def save_md5(settings):
                         p1 = verts[tv[0]].co
                         p2 = verts[tv[1]].co
                         p3 = verts[tv[2]].co
-                        # Blender 4.x: @ replaces *
                         normal = (w_matrix.to_3x3() @ (p3 - p2).cross(p1 - p2)).normalized()
 
                     face_vertices = []
                     for i in range(3):
                         vi = tv[i]
+                        loop_idx = tri.loops[i]
+
+                        # Default: use per-vertex smooth normal for the stored value
+                        if tri.use_smooth:
+                            normal = vert_smooth_normal[vi]
+                        # else: flat normal already set above from triangle
+
                         vertex = vert_dict.get(vi, False)
 
                         if not vertex:
-                            # Blender 4.x: @ replaces *
                             coord = w_matrix @ verts[vi].co
-                            if tri.use_smooth:
-                                normal = (w_matrix.to_3x3() @ verts[vi].normal).normalized()
+                            # For v12, use per-loop corner normal as the stored value.
+                            # For v10, use smooth vertex normal (engine derives its own).
+                            if md5v12 and tri.use_smooth and loop_idx in loop_normal_data:
+                                normal = loop_normal_data[loop_idx]
                             vertex = vert_dict[vi] = Vertex(submesh, coord, normal)
+                            # Store the corner normal for this loop so we can compare
+                            # subsequent loops against it (corner-to-corner comparison)
+                            if loop_idx in loop_normal_data:
+                                vertex._corner_normal = loop_normal_data[loop_idx]
                             createA += 1
+
+                            # v12: tangent and bitangent sign from MikkTSpace
+                            if md5v12 and loop_idx in tangent_data:
+                                t_vec, b_sign = tangent_data[loop_idx]
+                                t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                vertex.tangent = t_world
+                                vertex.bitangent_sign = b_sign
+
+                            # v12: vertex color
+                            if md5v12 and color_layer:
+                                if color_layer.domain == 'POINT':
+                                    c = color_layer.data[vi].color
+                                else:  # 'CORNER'
+                                    c = color_layer.data[loop_idx].color
+                                vertex.color = (c[0], c[1], c[2], c[3])
 
                             # Gather bone influences
                             for g in me.vertices[vi].groups:
@@ -535,40 +681,125 @@ def save_md5(settings):
                                 except (IndexError, KeyError):
                                     continue
 
-                        elif not tri.use_smooth:
-                            # Clone for flat shading
-                            old_vertex = vertex
-                            vertex = Vertex(submesh, vertex.loc, normal)
-                            createB += 1
-                            vertex.cloned_from = old_vertex
-                            vertex.influences = old_vertex.influences
-                            old_vertex.clones.append(vertex)
+                        else:
+                            need_split = False
+
+                            if use_sharp_edges:
+                                # Check 1: sharp edges (from "Mark Sharp")
+                                if sharp_edge_verts:
+                                    for other_i in range(3):
+                                        if other_i != i:
+                                            other_vi = tv[other_i]
+                                            if frozenset((vi, other_vi)) in sharp_edge_verts:
+                                                need_split = True
+                                                break
+
+                                # Check 2: evaluated corner normals differ
+                                # (from Smooth by Angle modifier, custom normals)
+                                if not need_split and loop_idx in loop_normal_data and \
+                                   hasattr(vertex, '_corner_normal'):
+                                    ln = loop_normal_data[loop_idx]
+                                    vn = vertex._corner_normal
+                                    dot = ln[0]*vn[0] + ln[1]*vn[1] + ln[2]*vn[2]
+                                    if dot < 0.995:  # ~5.7 degrees
+                                        need_split = True
+
+                            if need_split:
+                                # Check existing clones for matching corner normal
+                                found_clone = False
+                                if loop_idx in loop_normal_data:
+                                    ln = loop_normal_data[loop_idx]
+                                    for clone in vertex.clones:
+                                        if hasattr(clone, '_corner_normal'):
+                                            cn = clone._corner_normal
+                                            cdot = ln[0]*cn[0] + ln[1]*cn[1] + ln[2]*cn[2]
+                                            if cdot >= 0.995:
+                                                vertex = clone
+                                                found_clone = True
+                                                break
+                                if not found_clone:
+                                    old_vertex = vertex
+                                    # v12: use corner normal for the split vertex
+                                    # v10: use smooth normal (engine derives its own)
+                                    split_normal = loop_normal_data[loop_idx]
+                                    vertex = Vertex(submesh, vertex.loc, split_normal)
+                                    vertex._corner_normal = loop_normal_data[loop_idx]
+                                    createB += 1
+                                    vertex.cloned_from = old_vertex
+                                    vertex.influences = old_vertex.influences
+                                    old_vertex.clones.append(vertex)
+                                    if md5v12 and loop_idx in tangent_data:
+                                        t_vec, b_sign = tangent_data[loop_idx]
+                                        t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                        vertex.tangent = t_world
+                                        vertex.bitangent_sign = b_sign
+                                    if md5v12 and color_layer:
+                                        vertex.color = old_vertex.color
+
+                            elif not tri.use_smooth:
+                                # Flat-shading clone
+                                old_vertex = vertex
+                                vertex = Vertex(submesh, vertex.loc, normal)
+                                createB += 1
+                                vertex.cloned_from = old_vertex
+                                vertex.influences = old_vertex.influences
+                                old_vertex.clones.append(vertex)
+                                if md5v12 and loop_idx in tangent_data:
+                                    t_vec, b_sign = tangent_data[loop_idx]
+                                    t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                    vertex.tangent = t_world
+                                    vertex.bitangent_sign = b_sign
+                                if md5v12 and color_layer:
+                                    vertex.color = old_vertex.color
 
                         # UV handling
                         if uv_layer:
-                            loop_idx = tri.loops[i]
                             uv = [uv_layer.data[loop_idx].uv[0],
                                   1.0 - uv_layer.data[loop_idx].uv[1]]
                             if not vertex.maps:
                                 vertex.maps.append(Map(*uv))
                             elif vertex.maps[0].u != uv[0] or vertex.maps[0].v != uv[1]:
-                                # Clone for different UV
                                 found = False
                                 for clone in vertex.clones:
                                     if clone.maps and \
                                        clone.maps[0].u == uv[0] and \
                                        clone.maps[0].v == uv[1]:
+                                        # Also check corner normal matches
+                                        if loop_idx in loop_normal_data and \
+                                           hasattr(clone, '_corner_normal'):
+                                            ln = loop_normal_data[loop_idx]
+                                            cn = clone._corner_normal
+                                            cdot = ln[0]*cn[0] + ln[1]*cn[1] + ln[2]*cn[2]
+                                            if cdot < 0.995:
+                                                continue
                                         vertex = clone
                                         found = True
                                         break
                                 if not found:
                                     old_vertex = vertex
-                                    vertex = Vertex(submesh, vertex.loc, vertex.normal)
+                                    # v12: use corner normal; v10: use smooth normal
+                                    if md5v12 and loop_idx in loop_normal_data:
+                                        clone_normal = loop_normal_data[loop_idx]
+                                    else:
+                                        clone_normal = normal
+                                    vertex = Vertex(submesh, vertex.loc, clone_normal)
+                                    if loop_idx in loop_normal_data:
+                                        vertex._corner_normal = loop_normal_data[loop_idx]
                                     createC += 1
                                     vertex.cloned_from = old_vertex
                                     vertex.influences = old_vertex.influences
                                     vertex.maps.append(Map(*uv))
                                     old_vertex.clones.append(vertex)
+                                    if md5v12:
+                                        vertex.color = old_vertex.color
+                                        if loop_idx in tangent_data:
+                                            t_vec, b_sign = tangent_data[loop_idx]
+                                            t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                            vertex.tangent = t_world
+                                            vertex.bitangent_sign = b_sign
+                                        else:
+                                            vertex.tangent = old_vertex.tangent
+                                            vertex.bitangent_sign = old_vertex.bitangent_sign
 
                         face_vertices.append(vertex)
 
@@ -603,7 +834,7 @@ def save_md5(settings):
 
         rangestart, rangeend = frame_range
         thearmature.animation_data.action = arm_action
-        animation = MD5Animation(skeleton)
+        animation = MD5Animation(skeleton, 10)
 
         currenttime = rangestart
         while currenttime <= rangeend:
@@ -611,7 +842,6 @@ def save_md5(settings):
             pose = thearmature.pose
 
             for bonename in thearmature.data.bones.keys():
-                # Blender 4.x: .copy() replaces Matrix(m) constructor
                 posebonemat = pose.bones[bonename].matrix.copy()
                 try:
                     bone = BONES[bonename]
@@ -619,13 +849,11 @@ def save_md5(settings):
                     continue
 
                 if bone.parent:
-                    # Blender 4.x: .inverted() @ replaces invert() then *
                     parentposemat = pose.bones[bone.parent.name].matrix.inverted()
                     posebonemat = parentposemat @ posebonemat
                 else:
                     posebonemat = thearmature.matrix_world @ posebonemat
 
-                # Blender 4.x: .translation replaces .col[3][0:3]
                 loc = list(posebonemat.translation)
                 rot = posebonemat.to_quaternion()
                 rot.normalize()
@@ -657,7 +885,7 @@ def save_md5(settings):
                     if sob and sob.type == 'MESH' and sob.name == submesh.name:
                         obj = sob
                 if obj is not None:
-                     objects.append(obj)
+                    objects.append(obj)
 
         generateboundingbox(objects, animation, [rangestart, rangeend])
         f.write(animation.to_md5anim())
@@ -680,19 +908,24 @@ def save_md5(settings):
             print("IOError writing " + md5mesh_filename)
             return
         f.write(skeleton.to_md5mesh(len(meshes[0].submeshes)))
-        f.write(meshes[0].to_md5mesh())
+        f.write(meshes[0].to_md5mesh(md5v12))
         f.close()
         print("saved mesh to " + md5mesh_filename)
+        if md5v12:
+            print("  MD5Version 12: normals, tangents, vertex colors included")
 
 
 class md5Settings:
-    def __init__(self, savepath, scale, actions, sel_only, prefix, name):
+    def __init__(self, savepath, scale, actions, sel_only, prefix, name,
+                 md5v12=False, use_sharp_edges=True):
         self.savepath = savepath
         self.scale = scale
         self.md5actions = actions
         self.sel_only = sel_only
         self.name = name
         self.prefix = prefix
+        self.md5v12 = md5v12
+        self.use_sharp_edges = use_sharp_edges
 
 # ---------------------------------------------------------------------------
 # UI Classes
@@ -863,6 +1096,18 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
         description="Use MD5name as prefix for MD5anim files",
         default=False)
 
+    md5v12: BoolProperty(
+        name="MD5 Version 12",
+        description="Export extended format with per-vertex normals, "
+                    "MikkTSpace tangents, and vertex colors",
+        default=False)
+
+    use_sharp_edges: BoolProperty(
+        name="Use sharp edges",
+        description="Split vertices at edges marked sharp in Blender. "
+                    "Works for both v10 and v12",
+        default=True)
+
     md5actions_idx: IntProperty()
 
     def draw(self, context):
@@ -874,6 +1119,11 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
         sub.enabled = len(self.md5name) == 0
         sub.label(text=os.path.splitext(os.path.basename(self.filepath))[0])
         box.prop(self, "md5scale")
+
+        # v12 checkbox
+        layout.separator()
+        layout.prop(self, "md5v12")
+        layout.prop(self, "use_sharp_edges")
 
         a_count = len(self.md5actions)
         if a_count == 0:
@@ -910,7 +1160,9 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
             actions=self.md5actions,
             sel_only=self.use_sel_only,
             prefix=self.use_prefix,
-            name=self.md5name)
+            name=self.md5name,
+            md5v12=self.md5v12,
+            use_sharp_edges=self.use_sharp_edges)
         save_md5(settings)
         return {'FINISHED'}
 
@@ -954,21 +1206,17 @@ classes = (
 
 
 def register():
-    # Register PropertyGroup first
     bpy.utils.register_class(ActionsPropertyGroup)
 
-    # Inject CollectionProperty before registering ExportMD5
     if 'md5actions' not in MD5_OT_Export.__annotations__:
         MD5_OT_Export.__annotations__['md5actions'] = CollectionProperty(
             type=ActionsPropertyGroup)
 
-    # Register remaining classes
     for cls in classes:
         if cls is ActionsPropertyGroup:
             continue
         bpy.utils.register_class(cls)
 
-    # Scene property for bone collection name
     bpy.types.Scene.md5_bone_collection = StringProperty(
         name="MD5 Bone Collection",
         description="Bone collection for MD5 export (leave empty to export all bones)",
