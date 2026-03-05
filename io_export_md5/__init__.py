@@ -509,35 +509,73 @@ def save_md5(settings):
 
     # --- Second pass: meshes ---
     meshes = []
+    depsgraph = bpy.context.evaluated_depsgraph_get()
     for obj in bpy.context.selected_objects:
         if obj.type == 'MESH' and len(obj.data.vertices) > 0:
-            me = obj.data
+            me = obj.data  # raw mesh for geometry, UVs, weights
             mesh = Mesh(obj.name)
             print("Processing mesh: " + obj.name)
             meshes.append(mesh)
+
+            # Get evaluated mesh for normals/tangents only
+            # (reflects modifiers like Smooth by Angle without altering geometry)
+            eval_obj = obj.evaluated_get(depsgraph)
+            eval_me = eval_obj.to_mesh()
 
             w_matrix = obj.matrix_world
             verts = me.vertices
 
             uv_layer = me.uv_layers.active
 
-            # v12: compute MikkTSpace tangents BEFORE loop triangles
-            # calc_tangents() can change internal split normal state,
-            # which may invalidate loop indices. We gather tangent data
-            # first, then (re)calculate loop_triangles for consistent indices.
-            tangent_data = {}  # loop_index -> (tangent_vec, bitangent_sign)
+            # Gather per-loop split normals from EVALUATED mesh.
+            # corner_normals reflect sharp edges, auto-smooth, custom normals,
+            # and any normal-affecting modifiers.
+            # We use these to DETECT where splits are needed, but for the actual
+            # stored normal value on smooth vertices, we use the raw vertex normal
+            # to preserve exact consistency with bone transforms.
+            w_mat3 = w_matrix.to_3x3()
+            loop_normal_data = {}  # loop_index -> normal_vec (world space)
+            # Only use evaluated normals if vertex count matches (modifiers
+            # didn't change topology). If topology changed, fall back to raw.
+            if len(eval_me.vertices) == len(me.vertices) and \
+               len(eval_me.loops) == len(me.loops):
+                for loop in eval_me.loops:
+                    cn = eval_me.corner_normals[loop.index].vector
+                    loop_normal_data[loop.index] = (w_mat3 @ cn).normalized()
+                print("  Split normals from evaluated mesh: %d loops" % len(loop_normal_data))
+            else:
+                print("  WARNING: Modifier changes topology (%d->%d verts), "
+                      "using raw normals" % (len(me.vertices), len(eval_me.vertices)))
+                for loop in me.loops:
+                    cn = me.corner_normals[loop.index].vector
+                    loop_normal_data[loop.index] = (w_mat3 @ cn).normalized()
+
+            # Per-vertex smooth normal from RAW mesh
+            vert_smooth_normal = {}
+            for vi_idx in range(len(verts)):
+                vert_smooth_normal[vi_idx] = (w_mat3 @ verts[vi_idx].normal).normalized()
+
+            print("  Split normals gathered for %d loops" % len(loop_normal_data))
+
+            # v12: compute MikkTSpace tangents from evaluated mesh
+            tangent_data = {}
             if md5v12 and uv_layer:
-                try:
-                    me.calc_tangents(uvmap=uv_layer.name)
-                    for loop in me.loops:
-                        tangent_data[loop.index] = (
-                            loop.tangent.copy(),
-                            loop.bitangent_sign
-                        )
-                    print("  MikkTSpace tangents computed for %d loops" % len(tangent_data))
-                    me.free_tangents()
-                except Exception as e:
-                    print("  WARNING: calc_tangents failed: %s" % str(e))
+                eval_uv = eval_me.uv_layers.active
+                if eval_uv and len(eval_me.vertices) == len(me.vertices):
+                    try:
+                        eval_me.calc_tangents(uvmap=eval_uv.name)
+                        for loop in eval_me.loops:
+                            tangent_data[loop.index] = (
+                                loop.tangent.copy(),
+                                loop.bitangent_sign
+                            )
+                        print("  MikkTSpace tangents computed for %d loops" % len(tangent_data))
+                        eval_me.free_tangents()
+                    except Exception as e:
+                        print("  WARNING: calc_tangents failed: %s" % str(e))
+
+            # Free evaluated mesh — we're done with it
+            eval_obj.to_mesh_clear()
 
             me.calc_loop_triangles()
             tri_faces = list(me.loop_triangles)
@@ -582,13 +620,25 @@ def save_md5(settings):
                     for i in range(3):
                         vi = tv[i]
                         loop_idx = tri.loops[i]
+
+                        # Default: use per-vertex smooth normal for the stored value
+                        if tri.use_smooth:
+                            normal = vert_smooth_normal[vi]
+                        # else: flat normal already set above from triangle
+
                         vertex = vert_dict.get(vi, False)
 
                         if not vertex:
                             coord = w_matrix @ verts[vi].co
-                            if tri.use_smooth:
-                                normal = (w_matrix.to_3x3() @ verts[vi].normal).normalized()
+                            # For v12, use per-loop corner normal as the stored value.
+                            # For v10, use smooth vertex normal (engine derives its own).
+                            if md5v12 and tri.use_smooth and loop_idx in loop_normal_data:
+                                normal = loop_normal_data[loop_idx]
                             vertex = vert_dict[vi] = Vertex(submesh, coord, normal)
+                            # Store the corner normal for this loop so we can compare
+                            # subsequent loops against it (corner-to-corner comparison)
+                            if loop_idx in loop_normal_data:
+                                vertex._corner_normal = loop_normal_data[loop_idx]
                             createA += 1
 
                             # v12: tangent and bitangent sign from MikkTSpace
@@ -615,21 +665,65 @@ def save_md5(settings):
                                 except (IndexError, KeyError):
                                     continue
 
-                        elif not tri.use_smooth:
-                            old_vertex = vertex
-                            vertex = Vertex(submesh, vertex.loc, normal)
-                            createB += 1
-                            vertex.cloned_from = old_vertex
-                            vertex.influences = old_vertex.influences
-                            old_vertex.clones.append(vertex)
-                            # v12: tangent for flat-shaded clone
-                            if md5v12 and loop_idx in tangent_data:
-                                t_vec, b_sign = tangent_data[loop_idx]
-                                t_world = (w_matrix.to_3x3() @ t_vec).normalized()
-                                vertex.tangent = t_world
-                                vertex.bitangent_sign = b_sign
-                            if md5v12 and color_layer:
-                                vertex.color = old_vertex.color
+                        else:
+                            # Check if this loop's corner normal differs from the
+                            # existing vertex's corner normal (sharp edge detection).
+                            # We compare corner-to-corner from the SAME mesh (evaluated)
+                            # to avoid mismatches between different computation methods.
+                            need_split = False
+                            if loop_idx in loop_normal_data and \
+                               hasattr(vertex, '_corner_normal'):
+                                ln = loop_normal_data[loop_idx]
+                                vn = vertex._corner_normal
+                                dot = ln[0]*vn[0] + ln[1]*vn[1] + ln[2]*vn[2]
+                                if dot < 0.995:  # ~5.7 degrees
+                                    # Check existing clones for matching corner normal
+                                    found_clone = False
+                                    for clone in vertex.clones:
+                                        if hasattr(clone, '_corner_normal'):
+                                            cn = clone._corner_normal
+                                            cdot = ln[0]*cn[0] + ln[1]*cn[1] + ln[2]*cn[2]
+                                            if cdot >= 0.995:
+                                                vertex = clone
+                                                found_clone = True
+                                                break
+                                    if not found_clone:
+                                        need_split = True
+
+                            if need_split:
+                                old_vertex = vertex
+                                # v12: use corner normal for the split vertex
+                                # v10: use smooth normal (engine derives its own)
+                                split_normal = loop_normal_data[loop_idx] if md5v12 else normal
+                                vertex = Vertex(submesh, vertex.loc, split_normal)
+                                vertex._corner_normal = loop_normal_data[loop_idx]
+                                createB += 1
+                                vertex.cloned_from = old_vertex
+                                vertex.influences = old_vertex.influences
+                                old_vertex.clones.append(vertex)
+                                if md5v12 and loop_idx in tangent_data:
+                                    t_vec, b_sign = tangent_data[loop_idx]
+                                    t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                    vertex.tangent = t_world
+                                    vertex.bitangent_sign = b_sign
+                                if md5v12 and color_layer:
+                                    vertex.color = old_vertex.color
+
+                            elif not tri.use_smooth:
+                                # Flat-shading clone
+                                old_vertex = vertex
+                                vertex = Vertex(submesh, vertex.loc, normal)
+                                createB += 1
+                                vertex.cloned_from = old_vertex
+                                vertex.influences = old_vertex.influences
+                                old_vertex.clones.append(vertex)
+                                if md5v12 and loop_idx in tangent_data:
+                                    t_vec, b_sign = tangent_data[loop_idx]
+                                    t_world = (w_matrix.to_3x3() @ t_vec).normalized()
+                                    vertex.tangent = t_world
+                                    vertex.bitangent_sign = b_sign
+                                if md5v12 and color_layer:
+                                    vertex.color = old_vertex.color
 
                         # UV handling
                         if uv_layer:
@@ -643,28 +737,42 @@ def save_md5(settings):
                                     if clone.maps and \
                                        clone.maps[0].u == uv[0] and \
                                        clone.maps[0].v == uv[1]:
+                                        # Also check corner normal matches
+                                        if loop_idx in loop_normal_data and \
+                                           hasattr(clone, '_corner_normal'):
+                                            ln = loop_normal_data[loop_idx]
+                                            cn = clone._corner_normal
+                                            cdot = ln[0]*cn[0] + ln[1]*cn[1] + ln[2]*cn[2]
+                                            if cdot < 0.995:
+                                                continue
                                         vertex = clone
                                         found = True
                                         break
                                 if not found:
                                     old_vertex = vertex
-                                    vertex = Vertex(submesh, vertex.loc, vertex.normal)
+                                    # v12: use corner normal; v10: use smooth normal
+                                    if md5v12 and loop_idx in loop_normal_data:
+                                        clone_normal = loop_normal_data[loop_idx]
+                                    else:
+                                        clone_normal = normal
+                                    vertex = Vertex(submesh, vertex.loc, clone_normal)
+                                    if loop_idx in loop_normal_data:
+                                        vertex._corner_normal = loop_normal_data[loop_idx]
                                     createC += 1
                                     vertex.cloned_from = old_vertex
                                     vertex.influences = old_vertex.influences
                                     vertex.maps.append(Map(*uv))
                                     old_vertex.clones.append(vertex)
-                                    # v12: copy tangent data to UV-split clone
                                     if md5v12:
-                                        vertex.tangent = old_vertex.tangent
-                                        vertex.bitangent_sign = old_vertex.bitangent_sign
                                         vertex.color = old_vertex.color
-                                        # Override with this loop's tangent if available
                                         if loop_idx in tangent_data:
                                             t_vec, b_sign = tangent_data[loop_idx]
                                             t_world = (w_matrix.to_3x3() @ t_vec).normalized()
                                             vertex.tangent = t_world
                                             vertex.bitangent_sign = b_sign
+                                        else:
+                                            vertex.tangent = old_vertex.tangent
+                                            vertex.bitangent_sign = old_vertex.bitangent_sign
 
                         face_vertices.append(vertex)
 
@@ -699,7 +807,7 @@ def save_md5(settings):
 
         rangestart, rangeend = frame_range
         thearmature.animation_data.action = arm_action
-        animation = MD5Animation(skeleton, md5_version)
+        animation = MD5Animation(skeleton, 10)
 
         currenttime = rangestart
         while currenttime <= rangeend:
