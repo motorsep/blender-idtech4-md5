@@ -1,22 +1,52 @@
 # MD5 Version 12 Format Specification
 
-**Version:** 2.0
-**Date:** March 2026
-**Status:** Exporter complete, engine implementation in progress
+**Version:** 2.1
+**Date:** June 2026
+**Status:** Exporter complete (tangent generation reworked, see Changelog); engine implementation in progress
+
+---
+
+## Changelog
+
+### 2.1 (June 2026) — Tangent recomputation + shader cleanup
+
+- **Exporter tangent source reworked.** v2.0 took tangents straight from
+  Blender's `calc_tangents()`. That path desynced from the stored normals (it
+  gathered tangents on the *evaluated* mesh, keyed by eval loop index, but
+  assigned them by *raw*-mesh loop index), so when a modifier changed the loop
+  layout the tangent was taken from the wrong loop. Exported tangents came out
+  neither perpendicular to the stored normal nor aligned with the stored UVs —
+  measured ~101° tangent-to-normal on a real mesh (should be 90°), producing
+  UV-shell shading seams. The exporter now **recomputes** the tangent frame from
+  the final exported geometry instead of trusting `calc_tangents()`. See
+  "Tangent Generation" below.
+- **Engine-side note clarified.** "No shader changes required" still holds, but
+  *only* because the exported tangents are now orthonormal to the normals. A
+  per-pixel cotangent (Schüler/Mikkelsen) frame was used in
+  `interaction_uber.pixel` as a temporary bring-up workaround while the exporter
+  was emitting bad tangents; with correct v12 tangents it is redundant and has
+  been retired (reverted to the per-vertex path). See "No Shader Changes Required".
+- **Validation tooling added.** `check_md5_tangents.py` and `check_uv_match.py`,
+  documented under "Validation Tooling".
+- **Important framing correction:** the exported tangents are a Lengyel-style
+  orthonormal frame, *close to but not bit-identical to* true MikkTSpace. See
+  "Tangent Generation" for the accuracy note.
 
 ---
 
 ## Overview
 
 MD5 Version 12 is a backward-compatible extension of the idTech 4 MD5 format
-(version 10) that adds per-vertex normals, MikkTSpace tangent frames, and vertex
+(version 10) that adds per-vertex normals, orthonormal tangent frames, and vertex
 colors to `md5mesh` files. The `md5anim` format is structurally identical and
 always uses version 10.
 
-The primary benefit is correct normal map rendering: MikkTSpace tangents from the
-exporter match what modern baking tools (Blender, Substance Painter, Marmoset,
-xNormal) produce, eliminating tangent basis mismatches that cause subtle shading
-errors in v10.
+The primary benefit is correct normal map rendering: the exporter writes a
+per-vertex tangent frame that is orthonormal to the stored normal and consistent
+with the UVs, so it aligns with what modern baking tools (Blender, Substance
+Painter, Marmoset, xNormal) produce and eliminates the tangent basis mismatches
+that cause subtle shading errors in v10. The frame is Lengyel-style and close to,
+but not bit-identical to, true MikkTSpace (see "Tangent Generation").
 
 ---
 
@@ -26,7 +56,7 @@ errors in v10.
 |---------|-----|-----|
 | `MD5Version` header | `10` | `12` |
 | Per-vertex normal | Not stored; derived from geometry | Stored in bone-local space |
-| Per-vertex tangent | Not stored; derived from geometry | MikkTSpace tangent in bone-local space |
+| Per-vertex tangent | Not stored; derived from geometry | Orthonormal tangent in bone-local space (recomputed from geometry; ⊥ to normal) |
 | Bitangent sign | Not stored | Stored as 4th tangent component (±1) |
 | Vertex colors | Not possible (color/color2 used for skinning) | Optional `vertexcolor` block per mesh |
 | `vert` line format | `( u v ) firstWeight weightCount` | `( u v ) firstWeight weightCount ( nx ny nz ) ( tx ty tz tw )` |
@@ -62,11 +92,15 @@ The exporter never modifies the Blender scene. All data comes from the raw mesh
 (`evaluated_get(depsgraph).to_mesh()`) is used only to gather:
 
 - Per-loop corner normals (for sharp edge split detection and v12 normal values)
-- MikkTSpace tangents (for v12 tangent values)
 
 The evaluated mesh is freed immediately after gathering this data. Sharp edge
 splitting creates duplicate vertices only in the exported MD5 data structures,
 not in Blender's mesh.
+
+> **2.1:** the evaluated mesh is no longer used for tangents. `calc_tangents()`
+> is not relied upon (its values desynced from the stored normals — see
+> Changelog). Tangents are recomputed from the final exported geometry; see
+> "Tangent Generation".
 
 ### Normal Sources
 
@@ -79,6 +113,46 @@ For **split vertices** (at sharp edges, when "Use sharp edges" is checked):
 - For v10 this value is not written to file (engine derives normals from geometry;
   the split itself creates the geometric discontinuity for correct normals)
 - For v12 this value is transformed to bone-local space and written to the file
+
+### Tangent Generation (v12 only)
+
+**As of 2.1 the exporter recomputes the tangent frame from the final exported
+geometry** rather than reading `calc_tangents()`. This is a post-process pass
+(`recompute_tangents_v12`) that runs after all submesh vertices and faces are
+built, before the bone-local transform and file write. For each submesh:
+
+1. **Per face**, derive the tangent `T` and bitangent `B` from the UV gradient
+   (Lengyel): `T = (e1·dv2 − e2·dv1)/det`, `B = (e2·du1 − e1·du2)/det`, using the
+   world-space vertex positions and the *stored* (V-flipped) md5 UVs.
+2. **Area-weight and direction-normalize** each face's contribution
+   (`T = normalize(T)·area`) so heavily UV-stretched faces — tiny UV area, huge
+   `1/det` — cannot dominate the accumulated frame or flip the handedness sign.
+3. **Per vertex**, Gram-Schmidt the accumulated tangent against the stored normal
+   (`T = normalize(T − N·dot(N,T))`), guaranteeing `T ⊥ N`.
+4. **Bitangent sign** `tw` is taken from the UV winding:
+   `+1` if `dot(cross(N,T), B) ≥ 0`, else `−1`. Non-mirrored meshes come out
+   near-uniform; a handful of degenerate-UV verts may receive an arbitrary sign,
+   which is harmless.
+
+A second Gram-Schmidt is applied in bone-local space at write time, so the
+written tangent is perpendicular to the written normal even if the dominant-bone
+matrix carries scale.
+
+**Why recompute instead of fixing `calc_tangents()` indexing:** the recompute
+operates only on data that is actually written to the file, so it is immune to
+the evaluated-vs-raw mesh loop mismatch, object scale, and modifier stacks that
+made `calc_tangents()` unreliable. The trade-off is accuracy: this is a
+Lengyel-style frame, **close to but not bit-identical to MikkTSpace**. The
+residual difference from a true MikkTSpace bake is far below the error of the
+old corrupt data and, in practice, below visible threshold. If an exact
+MikkTSpace match is ever required, the alternative is to fix the indexing
+(compute `calc_tangents()` on the same raw mesh that is iterated) and keep the
+bone-local Gram-Schmidt net — but the recompute is the default because it is
+robust without per-scene testing.
+
+**Invariant:** every exported v12 tangent is unit-length and perpendicular to its
+vertex normal. Verify with `check_md5_tangents.py` (see Validation Tooling) — a
+correct export reports mean angle 90.00° and PASS.
 
 ### Bone-Local Transform (v12 only)
 
@@ -163,8 +237,8 @@ vert INDEX ( u v ) FIRST_WEIGHT WEIGHT_COUNT ( nx ny nz ) ( tx ty tz tw )
 | `FIRST_WEIGHT` | int | Index of first weight in weights block |
 | `WEIGHT_COUNT` | int | Number of weights (max 4) |
 | `nx ny nz` | float | Vertex normal in bone-local space (unit length) |
-| `tx ty tz` | float | MikkTSpace tangent in bone-local space (unit length) |
-| `tw` | float | Bitangent sign: `+1.0` or `-1.0` |
+| `tx ty tz` | float | Tangent in bone-local space, unit length, **guaranteed perpendicular to the normal** (recomputed from geometry; Lengyel-style, MikkTSpace-compatible) |
+| `tw` | float | Bitangent sign: `+1.0` or `-1.0`, from UV winding |
 
 ### Vertex Colors Block (Optional)
 
@@ -220,6 +294,22 @@ float3 vBitangent = cross( vNormal.xyz, vTangent.xyz ) * vTangent.w;
 `SetNormal()` / `SetTangent()` / `SetBiTangentSign()` in `DrawVert.h` pack into
 the same byte format that shaders unpack with `* 2.0 - 1.0`.
 
+> **2.1 — important caveat.** This "no shader changes" claim holds *only* when
+> the exported tangents are orthonormal to the normals. The reconstruction above
+> builds `vBitangent = cross(N, T)·tw` and decodes the normal map in that basis;
+> a tangent that is not perpendicular to `N` skews the frame and produces
+> UV-shell seams — which is exactly what the pre-2.1 exporter caused.
+>
+> During bring-up, while the exporter was emitting non-perpendicular tangents, a
+> per-pixel cotangent (Schüler/Mikkelsen) frame was added to
+> `interaction_uber.pixel` to reconstruct the basis from screen-space `ddx/ddy`
+> derivatives and sidestep the bad per-vertex data. With 2.1 exporting correct
+> tangents, that workaround is redundant — it added a per-fragment derivative
+> solve per light plus a faint view-dependent residual — and has been **retired**
+> (reverted to the per-vertex path, restoring the `bumpFlatness` blend). The
+> terrain shaders never carried it in shipped form. Net: with a 2.1-or-later
+> export, no shader changes are required, as designed.
+
 ### ParseMesh Changes
 
 1. Parse `( nx ny nz ) ( tx ty tz tw )` after weight indices for v12 verts
@@ -249,6 +339,49 @@ Options: new vertex attribute, texture/SSBO lookup, or bake into diffuse.
 
 ---
 
+## Validation Tooling
+
+Because the engine trusts the stored v12 tangents and does **not** re-derive them
+(in-engine re-derivation reintroduces the classic idTech 4 UV-seam problem,
+visible even without normal maps), exporter correctness is load-bearing. Two
+standalone, dependency-free checkers gate it:
+
+**`check_md5_tangents.py <mesh.md5mesh>`** — reads each v12 vert and reports the
+angle between the stored tangent and stored normal. A correct export is mean
+90.00° with ~100% of verts within 5° of perpendicular → PASS. A corrupt export
+(the pre-2.1 bug) reports a mean well off 90° (e.g. ~101°, with verts ranging
+3°–180°) → FAIL. Run this on every md5 export; a regression announces itself
+immediately without a bake or engine load.
+
+**`check_uv_match.py <mesh.obj> <mesh.md5mesh>`** — confirms the bake mesh and the
+md5 share the same UV unwrap (V-flip aware). PASS means the normal map baked
+against the OBJ will align with the md5 in-game.
+
+## Pipeline Notes — UV Unwrap Consistency
+
+A tangent-space normal map is baked relative to a specific unwrap's tangents and
+UVs. The mesh you bake against (the OBJ/FBX handed to Substance/Marmoset/xNormal)
+and the md5 the engine loads **must carry the same UV coordinates**. They may
+differ in vertex/triangle count — OBJ and md5 split UV seams slightly differently
+— but the UV coordinate set must match (the md5 V is flipped: `1 − blender_v`).
+
+The exporter does not re-unwrap or repack; its only UV transform is the V-flip. So
+a mismatch never originates in the exporter — it means the two files were
+generated from different UV state. Common causes:
+
+- **More than one UV map**, where the OBJ exporter grabbed the active-*render*
+  layer (camera icon) while the md5 exporter read `uv_layers.active` (the
+  highlighted row). Keep a single UV map, or ensure both icons point at the same
+  one.
+- **A stale bake mesh** exported before a re-unwrap.
+
+You do **not** need a rigged mesh to bake — bones are irrelevant to a normal-map
+bake. Export the low-poly (same object, same UV map that feeds the md5) to OBJ,
+rigged or not. Run `check_uv_match.py` on the exact pair before spending a bake;
+it must report SAME UNWRAP.
+
+---
+
 ## Testing Checklist
 
 | Test | Expected Result |
@@ -265,6 +398,9 @@ Options: new vertex attribute, texture/SSBO lookup, or bake into diffuse.
 | Engine loads v10/v12 anim | Both accepted |
 | Normal map baked in Blender | v12 matches Blender viewport |
 | Blender scene after export | Unchanged (non-destructive) |
+| `check_md5_tangents.py` on v12 export | PASS — mean 90.00°, ~100% within 5° of perpendicular |
+| `check_uv_match.py` on bake-OBJ + md5 pair | SAME UNWRAP |
+| v12 in-game, normal map across UV shells | No shading seam at shell boundaries |
 
 ---
 
