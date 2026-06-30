@@ -204,6 +204,9 @@ class Vertex:
         if self.tangent:
             t_world = mathutils.Vector(self.tangent).normalized()
             t_local = (inv_bone @ t_world).normalized()
+            # Guarantee perpendicularity in the bone-local space the engine
+            # reconstructs the frame in (covers any non-orthonormal bone matrix).
+            t_local = (t_local - n_local * n_local.dot(t_local)).normalized()
         else:
             t_local = mathutils.Vector((1, 0, 0))
 
@@ -462,6 +465,82 @@ def get_export_bone_names(armature_obj):
     names = set(b.name for b in arm.bones)
     print("MD5 Export: no bone collection, exporting ALL %d bones" % len(names))
     return names
+
+# ---------------------------------------------------------------------------
+# v12 tangent recomputation
+# ---------------------------------------------------------------------------
+
+def recompute_tangents_v12(meshes):
+    """Rebuild per-vertex tangent frames from the FINAL exported geometry.
+
+    The tangents gathered from Blender's calc_tangents() are computed on the
+    evaluated mesh and keyed by its loop indices, but they are assigned using
+    raw-mesh loop indices during the build. When a modifier changes the loop
+    layout (so eval loops != raw loops) the tangent ends up taken from the
+    wrong loop, while the stored split normal is taken (correctly) from the raw
+    mesh. The result is a tangent that is neither perpendicular to the stored
+    normal nor aligned with the stored UVs.
+
+    This pass discards those tangents and derives a clean frame directly from
+    the data that actually gets written: world-space vertex position (loc), the
+    stored split normal, and the stored (already V-flipped) md5 UV. The tangent
+    is orthonormalized against the stored normal (so T is guaranteed perpendi-
+    cular to N, exactly what the engine's B = cross(N,T)*w reconstruction needs)
+    and the bitangent sign is derived from the UV winding so mirrored shells get
+    the correct handedness. Position/UV winding cancels out, so this is robust
+    to the reversed md5 triangle order.
+    """
+    Vector = mathutils.Vector
+    for mesh in meshes:
+        for sm in mesh.submeshes:
+            n = len(sm.vertices)
+            tan = [Vector((0.0, 0.0, 0.0)) for _ in range(n)]
+            bit = [Vector((0.0, 0.0, 0.0)) for _ in range(n)]
+            vidx = {id(v): i for i, v in enumerate(sm.vertices)}
+            for f in sm.faces:
+                a, b, c = f.vertex1, f.vertex2, f.vertex3
+                if not (a.maps and b.maps and c.maps):
+                    continue
+                p0 = Vector(a.loc)
+                e1 = Vector(b.loc) - p0
+                e2 = Vector(c.loc) - p0
+                ua, ub, uc = a.maps[0], b.maps[0], c.maps[0]
+                du1 = ub.u - ua.u
+                dv1 = ub.v - ua.v
+                du2 = uc.u - ua.u
+                dv2 = uc.v - ua.v
+                det = du1 * dv2 - du2 * dv1
+                if abs(det) < 1e-12:
+                    continue
+                r = 1.0 / det
+                T = (e1 * dv2 - e2 * dv1) * r
+                B = (e2 * du1 - e1 * du2) * r
+                # Weight each face by its 3D area and normalize its direction,
+                # so heavily UV-stretched faces (tiny UV area -> huge 1/det)
+                # cannot dominate the accumulated frame or flip the handedness.
+                area = e1.cross(e2).length * 0.5
+                if T.length > 1e-12:
+                    T = T.normalized() * area
+                if B.length > 1e-12:
+                    B = B.normalized() * area
+                for vert in (a, b, c):
+                    i = vidx[id(vert)]
+                    tan[i] += T
+                    bit[i] += B
+            for i, v in enumerate(sm.vertices):
+                N = Vector(v.normal).normalized()
+                T = tan[i] - N * N.dot(tan[i])   # Gram-Schmidt against stored N
+                if T.length < 1e-9:
+                    # degenerate UVs at this vertex: fall back to any perpendicular
+                    T = N.cross(Vector((0.0, 0.0, 1.0)))
+                    if T.length < 1e-6:
+                        T = N.cross(Vector((1.0, 0.0, 0.0)))
+                T.normalize()
+                # handedness: does cross(N,T) agree with the UV bitangent?
+                w = 1.0 if N.cross(T).dot(bit[i]) >= 0.0 else -1.0
+                v.tangent = T
+                v.bitangent_sign = w
+
 
 # ---------------------------------------------------------------------------
 # Main export function
@@ -810,6 +889,14 @@ def save_md5(settings):
     if not meshes:
         print("No meshes found!")
         return
+
+    # v12: replace gathered calc_tangents() values with a clean frame derived
+    # from the exported geometry, guaranteeing T perpendicular to the stored
+    # normal and correct bitangent handedness.
+    if md5v12:
+        recompute_tangents_v12(meshes)
+        print("  Recomputed v12 tangents from exported geometry "
+              "(orthonormal to stored normals, UV-consistent)")
 
     # --- Export animations ---
     if not thearmature.animation_data:
