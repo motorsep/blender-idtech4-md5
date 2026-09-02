@@ -32,12 +32,17 @@
 #   Per-vertex normals (bone-local space)
 #   MikkTSpace tangent + bitangent sign (bone-local space)
 #   Vertex colors (optional)
+# v2.2.0 Blender 5.2 compatibility:
+#   Action.fcurves removed -> iterate layers/strips/channelbags
+#   Slotted actions: bind an action slot when switching actions
+#   MeshEdge.use_sharp -> use_edge_sharp fallback
+#   calc_loop_triangles() optional (loop_triangles is lazy in 4.x+)
 
 bl_info = {
     "name": "Export idTech4.x MD5 (.md5mesh/.md5anim)",
     "author": "Paul Zirkle, der_ton, Gert De Roost, CodeManX, motorsep",
-    "version": (2, 1, 0),
-    "blender": (4, 2, 0),
+    "version": (2, 2, 0),
+    "blender": (4, 4, 0),
     "location": "File > Export > idTech 4.x MD5",
     "description": "Export idTech4.x MD5 mesh and animation (v10 and v12)",
     "warning": "",
@@ -467,6 +472,74 @@ def get_export_bone_names(armature_obj):
     return names
 
 # ---------------------------------------------------------------------------
+# Action helpers (Blender 4.4+ slotted actions, 5.2+ no Action.fcurves)
+# ---------------------------------------------------------------------------
+
+def iter_action_fcurves(action):
+    """Yield every F-Curve of an action.
+
+    Blender <= 4.3 (and legacy actions up to 5.1) expose Action.fcurves.
+    Slotted actions (4.4+) keep curves in
+    layers[] -> strips[] -> channelbags[] -> fcurves, and Blender 5.2 removed
+    the Action.fcurves compatibility shim entirely.
+    """
+    fcurves = getattr(action, "fcurves", None)
+    if fcurves is not None:
+        for fc in fcurves:
+            yield fc
+        return
+    for layer in getattr(action, "layers", ()):
+        for strip in layer.strips:
+            channelbags = getattr(strip, "channelbags", None)
+            if channelbags is None:
+                continue
+            for bag in channelbags:
+                for fc in bag.fcurves:
+                    yield fc
+
+
+def action_has_pose_curves(action):
+    for fc in iter_action_fcurves(action):
+        if fc.data_path.startswith("pose.bones"):
+            return True
+    return False
+
+
+def assign_action(anim_data, action, slot=None):
+    """Assign an action (and a slot on 4.4+) to an AnimData block.
+
+    Setting .action alone is not enough with slotted actions: without a bound
+    slot the action evaluates to nothing and every frame is the bind pose.
+    Blender auto-binds a slot only when its name matches the object, so we
+    pick one explicitly if that failed.
+    """
+    anim_data.action = action
+    if action is None or not hasattr(anim_data, "action_slot"):
+        return
+    if slot is not None:
+        try:
+            anim_data.action_slot = slot
+            return
+        except Exception as e:
+            print("MD5 Export: could not restore action slot: %s" % e)
+    if anim_data.action_slot is not None:
+        return
+    slots = getattr(action, "slots", None)
+    if not slots:
+        return
+    obj_slots = [s for s in slots
+                 if getattr(s, "target_id_type", 'OBJECT') == 'OBJECT']
+    chosen = obj_slots[0] if obj_slots else slots[0]
+    try:
+        anim_data.action_slot = chosen
+        print("MD5 Export: bound slot '%s' for action '%s'" % (
+            getattr(chosen, "name_display", chosen.identifier), action.name))
+    except Exception as e:
+        print("MD5 Export: WARNING could not bind slot for '%s': %s" % (
+            action.name, e))
+
+
+# ---------------------------------------------------------------------------
 # v12 tangent recomputation
 # ---------------------------------------------------------------------------
 
@@ -667,12 +740,16 @@ def save_md5(settings):
                             sharp_edge_verts.add(frozenset((edge.vertices[0], edge.vertices[1])))
                 else:
                     for edge in me.edges:
-                        if edge.use_sharp:
+                        if getattr(edge, "use_edge_sharp",
+                                   getattr(edge, "use_sharp", False)):
                             sharp_edge_verts.add(frozenset((edge.vertices[0], edge.vertices[1])))
                 if sharp_edge_verts:
                     print("  Sharp edges: %d (will split vertices)" % len(sharp_edge_verts))
 
-            me.calc_loop_triangles()
+            # loop_triangles is computed lazily since 4.x; calc_loop_triangles()
+            # may not exist on newer versions.
+            if hasattr(me, "calc_loop_triangles"):
+                me.calc_loop_triangles()
             tri_faces = list(me.loop_triangles)
 
             # v12: vertex colors
@@ -903,6 +980,7 @@ def save_md5(settings):
         thearmature.animation_data_create()
 
     orig_action = thearmature.animation_data.action
+    orig_slot = getattr(thearmature.animation_data, "action_slot", None)
 
     for a in settings.md5actions:
         if not a.export_action and settings.sel_only:
@@ -920,7 +998,7 @@ def save_md5(settings):
             frame_range = (min(pm_frames), max(pm_frames))
 
         rangestart, rangeend = frame_range
-        thearmature.animation_data.action = arm_action
+        assign_action(thearmature.animation_data, arm_action)
         animation = MD5Animation(skeleton, 10)
 
         currenttime = rangestart
@@ -979,7 +1057,7 @@ def save_md5(settings):
         f.close()
         print("saved anim to " + md5anim_filename)
 
-    thearmature.animation_data.action = orig_action
+    assign_action(thearmature.animation_data, orig_action, orig_slot)
 
     # --- Save mesh ---
     if len(meshes) > 1:
@@ -1257,10 +1335,7 @@ class MD5_OT_Export(bpy.types.Operator, ExportHelper):
         actions = self.md5actions
         actions.clear()
         for action in bpy.data.actions:
-            for fcurve in action.fcurves:
-                if fcurve.data_path.startswith("pose.bones"):
-                    break
-            else:
+            if not action_has_pose_curves(action):
                 continue
             item = actions.add()
             item.name = action.name
