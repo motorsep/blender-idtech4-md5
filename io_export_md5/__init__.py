@@ -37,11 +37,15 @@
 #   Slotted actions: bind an action slot when switching actions
 #   MeshEdge.use_sharp -> use_edge_sharp fallback
 #   calc_loop_triangles() optional (loop_triangles is lazy in 4.x+)
+# v2.2.1 md5anim bounds computed over ALL exported mesh objects
+#   (previously only the first selected object; the engine frustum-culls
+#   animated entities on these bounds, so a partial box made the model
+#   vanish when close)
 
 bl_info = {
     "name": "Export idTech4.x MD5 (.md5mesh/.md5anim)",
     "author": "Paul Zirkle, der_ton, Gert De Roost, CodeManX, motorsep",
-    "version": (2, 2, 0),
+    "version": (2, 2, 1),
     "blender": (4, 4, 0),
     "location": "File > Export > idTech 4.x MD5",
     "description": "Export idTech4.x MD5 mesh and animation (v10 and v12)",
@@ -1042,15 +1046,17 @@ def save_md5(settings):
             print("IOError writing " + md5anim_filename)
             continue
 
+        # Bounds must cover EVERY exported mesh object. At this point each
+        # Blender object is still its own Mesh entry (they are merged into
+        # meshes[0] only after the anims are written), so walk all of them.
         objects = []
-        for submesh in meshes[0].submeshes:
-            if len(submesh.vertices) > 0:
-                obj = None
-                for sob in bpy.context.selected_objects:
-                    if sob and sob.type == 'MESH' and sob.name == submesh.name:
-                        obj = sob
-                if obj is not None:
-                    objects.append(obj)
+        for mesh in meshes:
+            if not any(len(sm.vertices) > 0 for sm in mesh.submeshes):
+                continue
+            for sob in bpy.context.selected_objects:
+                if sob and sob.type == 'MESH' and sob.name == mesh.name \
+                   and sob not in objects:
+                    objects.append(sob)
 
         generateboundingbox(objects, animation, [rangestart, rangeend])
         f.write(animation.to_md5anim())
